@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import Peer, { DataConnection } from 'peerjs';
 import * as Y from 'yjs';
 
 export interface PeerInfo {
@@ -15,8 +14,10 @@ export interface DrawStroke {
   peerId: string;
 }
 
-interface SyncMessage {
-  type: 'sync-request' | 'sync-response' | 'stroke' | 'clear';
+interface RelayMessage {
+  type: 'welcome' | 'peer-count' | 'sync' | 'stroke' | 'clear';
+  id?: string;
+  count?: number;
   data?: unknown;
 }
 
@@ -30,23 +31,20 @@ const generatePeerColor = () => {
   return colors[Math.floor(Math.random() * colors.length)];
 };
 
-// Generate a peer ID that includes room info for discovery
-const generatePeerId = (roomId: string) => {
-  const randomPart = Math.random().toString(36).substring(2, 10);
-  return `mppaint-${roomId}-${randomPart}`;
-};
+// WebSocket relay server URL
+const RELAY_URL = import.meta.env.VITE_RELAY_URL || 'wss://mppaint-relay.nicklaudethorat.workers.dev';
 
 export function useRoom(roomId: string | null) {
   const [connected, setConnected] = useState(false);
-  const [peers, setPeers] = useState<Map<string, PeerInfo>>(new Map());
+  const [peerCount, setPeerCount] = useState(1);
   const [strokes, setStrokes] = useState<DrawStroke[]>([]);
   const [myPeerId] = useState(() => crypto.randomUUID());
   const [myColor] = useState(() => generatePeerColor());
 
-  const peerRef = useRef<Peer | null>(null);
-  const connectionsRef = useRef<Map<string, DataConnection>>(new Map());
+  const wsRef = useRef<WebSocket | null>(null);
   const ydocRef = useRef<Y.Doc | null>(null);
   const ystrokesRef = useRef<Y.Array<DrawStroke> | null>(null);
+  const reconnectTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!roomId) return;
@@ -64,112 +62,92 @@ export function useRoom(roomId: string | null) {
     };
     ystrokes.observe(observer);
 
-    // Create PeerJS peer with unique ID
-    const peerId = generatePeerId(roomId);
-    const peer = new Peer(peerId, {
-      // Use PeerJS free cloud server
-      debug: 0,
-    });
-    peerRef.current = peer;
+    // Connect to WebSocket relay
+    const connect = () => {
+      const ws = new WebSocket(`${RELAY_URL}/room/${roomId}`);
+      wsRef.current = ws;
 
-    const handleConnection = (conn: DataConnection) => {
-      conn.on('open', () => {
-        connectionsRef.current.set(conn.peer, conn);
-        setPeers(prev => {
-          const next = new Map(prev);
-          next.set(conn.peer, { id: conn.peer, color: generatePeerColor() });
-          return next;
-        });
+      ws.onopen = () => {
+        console.log('Connected to relay');
+        setConnected(true);
 
-        // Send our current state to new peer
+        // Send our current state to sync with others
         const state = Y.encodeStateAsUpdate(ydoc);
-        conn.send({ type: 'sync-response', data: Array.from(state) } as SyncMessage);
-      });
+        ws.send(JSON.stringify({
+          type: 'sync',
+          data: Array.from(state),
+        }));
+      };
 
-      conn.on('data', (data: unknown) => {
-        const msg = data as SyncMessage;
-        if (msg.type === 'sync-response') {
-          Y.applyUpdate(ydoc, new Uint8Array(msg.data as number[]));
-        } else if (msg.type === 'stroke') {
-          const stroke = msg.data as DrawStroke;
-          if (!ystrokes.toArray().find(s => s.id === stroke.id)) {
-            ystrokes.push([stroke]);
+      ws.onmessage = (event) => {
+        try {
+          const msg: RelayMessage = JSON.parse(event.data);
+
+          switch (msg.type) {
+            case 'welcome':
+              console.log('Welcomed with ID:', msg.id);
+              break;
+
+            case 'peer-count':
+              setPeerCount(msg.count || 1);
+              break;
+
+            case 'sync':
+              // Apply sync update from another peer
+              if (msg.data) {
+                Y.applyUpdate(ydoc, new Uint8Array(msg.data as number[]));
+              }
+              break;
+
+            case 'stroke':
+              // Add stroke from another peer
+              const stroke = msg.data as DrawStroke;
+              if (stroke && !ystrokes.toArray().find(s => s.id === stroke.id)) {
+                ystrokes.push([stroke]);
+              }
+              break;
+
+            case 'clear':
+              // Clear canvas
+              ystrokes.delete(0, ystrokes.length);
+              break;
           }
-        } else if (msg.type === 'clear') {
-          ystrokes.delete(0, ystrokes.length);
+        } catch (e) {
+          console.error('Failed to parse message:', e);
         }
-      });
+      };
 
-      conn.on('close', () => {
-        connectionsRef.current.delete(conn.peer);
-        setPeers(prev => {
-          const next = new Map(prev);
-          next.delete(conn.peer);
-          return next;
-        });
-      });
+      ws.onclose = () => {
+        console.log('Disconnected from relay');
+        setConnected(false);
+        wsRef.current = null;
+
+        // Reconnect after a delay
+        reconnectTimeoutRef.current = window.setTimeout(() => {
+          if (roomId) {
+            connect();
+          }
+        }, 2000);
+      };
+
+      ws.onerror = (error) => {
+        console.error('WebSocket error:', error);
+      };
     };
 
-    peer.on('open', () => {
-      setConnected(true);
-
-      // Try to connect to other peers in the same room
-      // We use a naming convention: mppaint-{roomId}-{random}
-      // The host is the one with the lexicographically smallest ID
-      // Other peers connect to peers they discover
-    });
-
-    peer.on('connection', handleConnection);
-
-    peer.on('error', (err) => {
-      console.error('PeerJS error:', err);
-    });
-
-    // Discovery: try to connect to potential hosts
-    // Since we can't list peers, we use a "room host" concept
-    // The first peer in a room acts as the host
-    const hostId = `mppaint-${roomId}-host`;
-
-    // If we're not the host, try connecting to the host
-    if (peerId !== hostId) {
-      // Wait for peer to be ready
-      peer.on('open', () => {
-        const conn = peer.connect(hostId, { reliable: true });
-        if (conn) {
-          handleConnection(conn);
-        }
-      });
-    }
-
-    // Also try to become the host if available
-    const hostPeer = new Peer(hostId, { debug: 0 });
-
-    hostPeer.on('open', () => {
-      // We successfully registered as host
-      console.log('Registered as room host');
-    });
-
-    hostPeer.on('connection', (conn) => {
-      // Forward to main peer's connection handler
-      handleConnection(conn);
-    });
-
-    hostPeer.on('error', (err) => {
-      // Host ID already taken - that's fine, someone else is host
-      if (err.type === 'unavailable-id') {
-        console.log('Room host exists, connecting as client');
-      }
-    });
+    connect();
 
     return () => {
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
       ystrokes.unobserve(observer);
-      connectionsRef.current.forEach(conn => conn.close());
-      connectionsRef.current.clear();
-      peer.destroy();
-      hostPeer.destroy();
       ydoc.destroy();
       setConnected(false);
-      setPeers(new Map());
+      setPeerCount(1);
     };
   }, [roomId]);
 
@@ -185,13 +163,13 @@ export function useRoom(roomId: string | null) {
     // Add locally to Yjs
     ystrokesRef.current?.push([fullStroke]);
 
-    // Broadcast to all connected peers
-    const msg: SyncMessage = { type: 'stroke', data: fullStroke };
-    connectionsRef.current.forEach(conn => {
-      if (conn.open) {
-        conn.send(msg);
-      }
-    });
+    // Broadcast to relay
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'stroke',
+        data: fullStroke,
+      }));
+    }
   }, [myPeerId]);
 
   const clearCanvas = useCallback(() => {
@@ -200,23 +178,20 @@ export function useRoom(roomId: string | null) {
       ystrokes.delete(0, ystrokes.length);
     }
 
-    // Broadcast clear to all peers
-    const msg: SyncMessage = { type: 'clear' };
-    connectionsRef.current.forEach(conn => {
-      if (conn.open) {
-        conn.send(msg);
-      }
-    });
+    // Broadcast clear to relay
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'clear' }));
+    }
   }, []);
 
   return {
     connected,
-    peers,
+    peers: new Map<string, PeerInfo>(), // We don't track individual peers with relay
     strokes,
     myPeerId,
     myColor,
     addStroke,
     clearCanvas,
-    peerCount: peers.size + 1, // +1 for self
+    peerCount,
   };
 }
