@@ -17,7 +17,7 @@
     "peerjs": "^1.5.5",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "trystero": "^0.22.0",
+    "trystero": "^0.26.0",
     "uuid": "^13.0.0",
     "y-partykit": "^0.0.33",
     "y-webrtc": "^10.3.0",
